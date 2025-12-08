@@ -1,39 +1,23 @@
 import os
-import argparse
 import sys
 import asyncio
-import sqlite3
-import hashlib
-import secrets
 import time
 from typing import List, Optional, Tuple
 from uuid import uuid4
 import gradio as gr
 from gradio_i18n import Translate, gettext as _
-import yaml
 
-from modules.utils.paths import (FASTER_WHISPER_MODELS_DIR, DIARIZATION_MODELS_DIR, OUTPUT_DIR, WHISPER_MODELS_DIR,
-                                 INSANELY_FAST_WHISPER_MODELS_DIR, NLLB_MODELS_DIR, DEFAULT_PARAMETERS_CONFIG_PATH,
-                                 UVR_MODELS_DIR, I18N_YAML_PATH, KNOWLEDGE_BASE_DIR, RAG_STORE_DIR)
+from core.config import AppConfig, parse_app_config
+from core.context import create_app_context
+from modules.utils.paths import DEFAULT_PARAMETERS_CONFIG_PATH, I18N_YAML_PATH
 from modules.utils.files_manager import load_yaml, MEDIA_EXTENSION
-from modules.whisper.whisper_factory import WhisperFactory
-from modules.translation.nllb_inference import NLLBInference
 from modules.ui.htmls import *
-from modules.utils.cli_manager import str2bool
 from modules.utils.youtube_manager import get_ytmetas
-from modules.translation.deepl_api import DeepLAPI
 from modules.whisper.data_classes import *
 from modules.utils.logger import get_logger
-from modules.face_search.service import FaceSearchService
-from modules.rag.text_corrector import TextCorrectionRAG
-from modules.rag.temp_chat import TemporaryRAGChatService
-
-
+from services.auth.service import AuthService
+from services.jobs.manager import BackgroundJobManager
 logger = get_logger()
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_AUTH_DB_PATH = os.path.join(BASE_DIR, "auth.db")
-DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "88888888"
 
 # 修复 Windows 上 asyncio 的连接重置警告
 def handle_exception(loop, context):
@@ -76,41 +60,29 @@ if sys.platform == 'win32':
         pass
 
 class App:
-    def __init__(self, args):
-        self.args = args
-        # Check every 1 hour (3600) for cached files and delete them if older than 1 day (86400)
-        self.app = gr.Blocks(css=CSS, theme=self.args.theme, delete_cache=(3600, 86400))
-        self.whisper_inf = WhisperFactory.create_whisper_inference(
-            whisper_type=self.args.whisper_type,
-            whisper_model_dir=self.args.whisper_model_dir,
-            faster_whisper_model_dir=self.args.faster_whisper_model_dir,
-            insanely_fast_whisper_model_dir=self.args.insanely_fast_whisper_model_dir,
-            uvr_model_dir=self.args.uvr_model_dir,
-            output_dir=self.args.output_dir,
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.app = gr.Blocks(css=CSS, theme=self.config.theme, delete_cache=(3600, 86400))
+        self.context = create_app_context(self.config, logger)
+        self.whisper_inf = self.context.whisper
+        self.nllb_inf = self.context.nllb
+        self.deepl_api = self.context.deepl_api
+        self.text_corrector = self.context.text_corrector
+        self.temp_chat_service = self.context.rag_chat_service
+        self.auth_service = AuthService(
+            db_path=self.config.auth_db_path,
+            default_admin_username=self.config.default_admin_username,
+            default_admin_password=self.config.default_admin_password,
+            logger=logger,
         )
-        self.nllb_inf = NLLBInference(
-            model_dir=self.args.nllb_model_dir,
-            output_dir=os.path.join(self.args.output_dir, "translations")
+        self.auth_service.init_db()
+        self.job_manager = BackgroundJobManager(
+            max_workers=self.config.max_background_workers,
+            logger=logger,
         )
-        self.deepl_api = DeepLAPI(
-            output_dir=os.path.join(self.args.output_dir, "translations")
-        )
-        try:
-            self.text_corrector = TextCorrectionRAG(
-                knowledge_dir=self.args.rag_kb_dir,
-                persist_dir=self.args.rag_store_dir,
-                embedding_model=self.args.rag_embedding_model,
-            )
-            self.whisper_inf.register_text_corrector(self.text_corrector)
-        except Exception as exc:
-            logger.warning(f"初始化 RAG 文本纠错失败，将禁用该功能：{exc}")
-            self.text_corrector = None
-        self.temp_chat_service = TemporaryRAGChatService(
-            embedding_model=self.args.rag_embedding_model
-        )
-        self.auth_db_path = self.args.auth_db_path or DEFAULT_AUTH_DB_PATH
-        self.default_admin_username = self.args.default_admin_username or DEFAULT_ADMIN_USERNAME
-        self.default_admin_password = self.args.default_admin_password or DEFAULT_ADMIN_PASSWORD
+        self.auth_db_path = self.config.auth_db_path
+        self.default_admin_username = self.config.default_admin_username
+        self.default_admin_password = self.config.default_admin_password
         self.i18n = load_yaml(I18N_YAML_PATH)
         self.default_params = load_yaml(DEFAULT_PARAMETERS_CONFIG_PATH)
         try:
@@ -120,227 +92,34 @@ class App:
         except Exception:
             pass
 
-        self.init_db()
-        logger.info(f"Use \"{self.args.whisper_type}\" implementation\n"
-                    f"Device \"{self.whisper_inf.device}\" is detected")
-
-    def _ensure_auth_storage(self):
-        db_dir = os.path.dirname(self.auth_db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-
-    def _connect_auth_db(self):
-        conn = sqlite3.connect(self.auth_db_path, timeout=5, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    @staticmethod
-    def _hash_password(password: str, salt_hex: Optional[str] = None) -> str:
-        if not password:
-            raise ValueError("Password is required.")
-        salt_bytes = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
-        hashed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, 120000)
-        return f"{salt_bytes.hex()}${hashed.hex()}"
-
-    @staticmethod
-    def _verify_password(password: str, stored_value: str) -> bool:
-        if not password or not stored_value:
-            return False
-        try:
-            salt_hex, hashed_hex = stored_value.split("$", 1)
-        except ValueError:
-            return False
-        computed_hash = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            bytes.fromhex(salt_hex),
-            120000
-        ).hex()
-        return secrets.compare_digest(hashed_hex, computed_hash)
-
-    def init_db(self):
-        self._ensure_auth_storage()
-        with self._connect_auth_db() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password TEXT NOT NULL,
-                    role TEXT NOT NULL DEFAULT 'user',
-                    status TEXT NOT NULL DEFAULT 'pending'
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)
-            """)
-            cur = conn.execute("SELECT id FROM users WHERE username=?", (self.default_admin_username,))
-            if not cur.fetchone():
-                hashed_pwd = self._hash_password(self.default_admin_password)
-                conn.execute(
-                    "INSERT INTO users (username, password, role, status) VALUES (?, ?, 'admin', 'active')",
-                    (self.default_admin_username, hashed_pwd)
-                )
-                logger.info(f"已创建默认管理员账号：{self.default_admin_username}")
+        logger.info(
+            f"Use \"{self.config.whisper_type}\" implementation\n"
+            f"Device \"{self.whisper_inf.device}\" is detected"
+        )
 
     def register_user(self, username: Optional[str], password: Optional[str]):
-        username = (username or "").strip()
-        password = password or ""
-        if not username or not password:
-            return False, "用户名和密码均不能为空。"
-        if len(password) < 6:
-            return False, "密码长度至少为 6 位。"
-        try:
-            hashed_pwd = self._hash_password(password)
-            with self._connect_auth_db() as conn:
-                conn.execute(
-                    "INSERT INTO users (username, password, role, status) VALUES (?, ?, 'user', 'pending')",
-                    (username, hashed_pwd)
-                )
-            return True, f"注册成功！{username} 已提交审核，请等待管理员批准。"
-        except sqlite3.IntegrityError:
-            return False, "该用户名已存在，请更换后再试。"
-        except Exception as exc:
-            logger.error(f"注册用户失败：{exc}", exc_info=True)
-            return False, f"注册失败：{exc}"
+        return self.auth_service.register_user(username, password)
 
     def login_user(self, username: Optional[str], password: Optional[str]):
-        username = (username or "").strip()
-        password = password or ""
-        if not username or not password:
-            return False, None, "请输入用户名和密码。"
-        try:
-            with self._connect_auth_db() as conn:
-                row = conn.execute(
-                    "SELECT password, role, status FROM users WHERE username=?",
-                    (username,)
-                ).fetchone()
-        except Exception as exc:
-            logger.error(f"登录查询失败：{exc}", exc_info=True)
-            return False, None, "登录失败，请稍后再试。"
-
-        if not row or not self._verify_password(password, row["password"]):
-            return False, None, "用户名或密码不正确。"
-        if row["status"] != "active":
-            return False, None, "该账号尚未通过管理员审核。"
-        return True, row["role"], f"欢迎，{username}！"
+        return self.auth_service.login_user(username, password)
 
     def get_pending_users(self):
-        try:
-            with self._connect_auth_db() as conn:
-                rows = conn.execute(
-                    "SELECT username FROM users WHERE status='pending' ORDER BY username ASC"
-                ).fetchall()
-            return [row["username"] for row in rows]
-        except Exception as exc:
-            logger.error(f"获取待审核用户失败：{exc}", exc_info=True)
-            return []
+        return self.auth_service.get_pending_users()
 
     def approve_user(self, username: Optional[str]):
-        username = (username or "").strip()
-        if not username:
-            return False, "请选择需要批准的用户名。"
-        try:
-            with self._connect_auth_db() as conn:
-                cur = conn.execute(
-                    "UPDATE users SET status='active' WHERE username=? AND status='pending'",
-                    (username,)
-                )
-                if cur.rowcount == 0:
-                    return False, "未找到该用户或该用户已被审核。"
-            return True, f"用户 {username} 已成功激活。"
-        except Exception as exc:
-            logger.error(f"批准用户失败：{exc}", exc_info=True)
-            return False, f"审批失败：{exc}"
+        return self.auth_service.approve_user(username)
 
     def get_all_users(self):
         """获取所有用户列表（不包括当前主账号admin）"""
-        try:
-            with self._connect_auth_db() as conn:
-                rows = conn.execute(
-                    "SELECT username, role, status FROM users WHERE username != ? ORDER BY username ASC",
-                    (self.default_admin_username,)
-                ).fetchall()
-            return [
-                {"username": row["username"], "role": row["role"], "status": row["status"]}
-                for row in rows
-            ]
-        except Exception as exc:
-            logger.error(f"获取用户列表失败：{exc}", exc_info=True)
-            return []
+        return self.auth_service.get_all_users()
 
     def grant_admin_role(self, target_username: Optional[str], current_username: Optional[str]):
         """赋予用户管理员权限（仅主账号admin可操作）"""
-        target_username = (target_username or "").strip()
-        current_username = (current_username or "").strip()
-        
-        if not target_username:
-            return False, "请选择要赋予管理员权限的用户。"
-        
-        # 检查当前用户是否是主账号admin
-        if current_username != self.default_admin_username:
-            return False, "只有主账号可以赋予管理员权限。"
-        
-        if target_username == self.default_admin_username:
-            return False, "不能修改主账号的权限。"
-        
-        try:
-            with self._connect_auth_db() as conn:
-                # 检查目标用户是否存在
-                cur = conn.execute(
-                    "SELECT id FROM users WHERE username=?",
-                    (target_username,)
-                )
-                if not cur.fetchone():
-                    return False, f"用户 {target_username} 不存在。"
-                
-                # 更新用户角色为admin
-                cur = conn.execute(
-                    "UPDATE users SET role='admin' WHERE username=?",
-                    (target_username,)
-                )
-                if cur.rowcount == 0:
-                    return False, f"更新用户 {target_username} 的权限失败。"
-            return True, f"已成功将 {target_username} 设置为管理员。"
-        except Exception as exc:
-            logger.error(f"赋予管理员权限失败：{exc}", exc_info=True)
-            return False, f"操作失败：{exc}"
+        return self.auth_service.grant_admin_role(target_username, current_username)
 
     def revoke_admin_role(self, target_username: Optional[str], current_username: Optional[str]):
         """撤销用户管理员权限（仅主账号admin可操作）"""
-        target_username = (target_username or "").strip()
-        current_username = (current_username or "").strip()
-        
-        if not target_username:
-            return False, "请选择要撤销管理员权限的用户。"
-        
-        # 检查当前用户是否是主账号admin
-        if current_username != self.default_admin_username:
-            return False, "只有主账号可以撤销管理员权限。"
-        
-        if target_username == self.default_admin_username:
-            return False, "不能修改主账号的权限。"
-        
-        try:
-            with self._connect_auth_db() as conn:
-                # 检查目标用户是否存在
-                cur = conn.execute(
-                    "SELECT id FROM users WHERE username=?",
-                    (target_username,)
-                )
-                if not cur.fetchone():
-                    return False, f"用户 {target_username} 不存在。"
-                
-                # 更新用户角色为user
-                cur = conn.execute(
-                    "UPDATE users SET role='user' WHERE username=?",
-                    (target_username,)
-                )
-                if cur.rowcount == 0:
-                    return False, f"更新用户 {target_username} 的权限失败。"
-            return True, f"已成功将 {target_username} 的管理员权限撤销。"
-        except Exception as exc:
-            logger.error(f"撤销管理员权限失败：{exc}", exc_info=True)
-            return False, f"操作失败：{exc}"
+        return self.auth_service.revoke_admin_role(target_username, current_username)
 
     def create_pipeline_inputs(self):
         whisper_params = self.default_params["whisper"]
@@ -368,7 +147,7 @@ class App:
 
         with gr.Accordion(_("Advanced Parameters"), open=False):
             whisper_inputs = WhisperParams.to_gradio_inputs(defaults=whisper_params, only_advanced=True,
-                                                            whisper_type=self.args.whisper_type,
+                                                            whisper_type=self.config.whisper_type,
                                                             available_compute_types=self.whisper_inf.available_compute_types,
                                                             compute_type=self.whisper_inf.current_compute_type)
             # Keep initial prompt slot in pipeline inputs to satisfy parameter mapping, but hide from UI
@@ -469,52 +248,71 @@ class App:
                         gr.Markdown("仅管理员可见，用于重新索引本地知识库，使 RAG 纠错能够读取最新 Markdown/Text 文档。")
                         btn_update_kb = gr.Button("更新知识库索引", variant="primary")
                         rag_update_feedback = gr.Markdown("")
+                    with gr.Accordion("后台任务监控", open=False, visible=False) as jobs_panel:
+                        gr.Markdown("仅管理员可见，用于查看最近的后台任务执行情况。")
+                        btn_refresh_jobs = gr.Button("刷新任务状态", size="sm")
+                        jobs_status_md = gr.Markdown("", elem_id="jobs_status")
                     with gr.Tabs():
                         with gr.TabItem(_("File")):  # tab1
-                            with gr.Column():
-                                input_file = gr.Files(type="filepath", label=_("Upload File here"), file_types=MEDIA_EXTENSION)
-                                tb_input_folder = gr.Textbox(label="Input Folder Path (Optional)",
-                                                             info="Optional: Specify the folder path where the input files are located, if you prefer to use local files instead of uploading them."
-                                                                  " Leave this field empty if you do not wish to use a local path.",
-                                                             visible=self.args.colab,
-                                                             value="")
-                                cb_include_subdirectory = gr.Checkbox(label="Include Subdirectory Files",
-                                                                      info="When using Input Folder Path above, whether to include all files in the subdirectory or not.",
-                                                                      visible=self.args.colab,
-                                                                      value=False)
-                                cb_save_same_dir = gr.Checkbox(label="Save outputs at same directory",
-                                                               info="When using Input Folder Path above, whether to save output in the same directory as inputs or not, in addition to the original"
-                                                                    " output directory.",
-                                                               visible=self.args.colab,
-                                                               value=True)
-                            with gr.Accordion(_("转录参数设置（可选）"), open=False):
-                                with gr.Column():
-                                    pipeline_params, dd_file_format, cb_timestamp = self.create_pipeline_inputs()
+                            gr.Markdown("#### 一键转写字幕")
+                            gr.Markdown(
+                                "支持上传媒体文件或指定本地文件夹。按需配置 Whisper/VAD/分轨等参数，点击开始即可生成字幕并自动执行 RAG 纠错。"
+                            )
+                            with gr.Row(equal_height=False):
+                                with gr.Column(scale=5, min_width=420, elem_id="file_tab_controls"):
+                                    with gr.Group():
+                                        gr.Markdown("**1. 选择输入源**")
+                                        input_file = gr.Files(type="filepath", label=_("Upload File here"), file_types=MEDIA_EXTENSION)
+                                        tb_input_folder = gr.Textbox(
+                                            label="Input Folder Path (Optional)",
+                                            info="可选：使用本地目录中的音频/视频文件，留空则使用上方上传的文件。",
+                                            visible=self.config.colab,
+                                            value="",
+                                        )
+                                        cb_include_subdirectory = gr.Checkbox(
+                                            label="Include Subdirectory Files",
+                                            info="勾选后会扫描子目录中的全部文件。",
+                                            visible=self.config.colab,
+                                            value=False,
+                                        )
+                                        cb_save_same_dir = gr.Checkbox(
+                                            label="Save outputs at same directory",
+                                            info="当使用本地目录时，是否将输出文件同步写回原目录。",
+                                            visible=self.config.colab,
+                                            value=True,
+                                        )
 
-                            with gr.Row():
-                                btn_run = gr.Button(_("GENERATE SUBTITLE FILE"), variant="primary")
-                            with gr.Column():
-                                tb_corrected_output = gr.Textbox(
-                                    label="RAG 纠错文本",
-                                    lines=8,
-                                    interactive=False,
-                                    placeholder="运行后展示 Qwen RAG 纠错后的文本"
-                                )
-                            with gr.Row():
-                                files_subtitles = gr.Files(label=_("Downloadable output file"), scale=3, interactive=False)
-                                btn_openfolder = gr.Button('📂', scale=1)
+                                    with gr.Accordion(_("转录参数设置（可选）"), open=False):
+                                        pipeline_params, dd_file_format, cb_timestamp = self.create_pipeline_inputs()
 
-                            with gr.Accordion(_("后处理选项（可选）"), open=False):
-                                cb_convert_t2s = gr.Checkbox(
-                                    label="Convert Traditional to Simplified (T->S)",
-                                    value=True,
-                                    info="If enabled, final subtitles will be converted to Simplified Chinese."
-                                )
+                                    with gr.Group():
+                                        gr.Markdown("**2. 运行任务**")
+                                        with gr.Row():
+                                            btn_run = gr.Button(_("GENERATE SUBTITLE FILE"), variant="primary")
+                                            job_status_md = gr.Markdown("", elem_id="transcription_job_status")
+                                        with gr.Accordion(_("后处理选项（可选）"), open=False):
+                                            cb_convert_t2s = gr.Checkbox(
+                                                label="Convert Traditional to Simplified (T->S)",
+                                                value=True,
+                                                info="启用后会在导出前做繁转简。",
+                                            )
+
+                                with gr.Column(scale=5, min_width=420, elem_id="file_tab_results"):
+                                    with gr.Group():
+                                        gr.Markdown("**输出与纠错**")
+                                        tb_corrected_output = gr.Textbox(
+                                            label="RAG 纠错文本",
+                                            lines=10,
+                                            interactive=False,
+                                            placeholder="运行后展示 Qwen RAG 纠错后的文本",
+                                        )
+                                        files_subtitles = gr.Files(label=_("Downloadable output file"), interactive=False)
+                                        btn_openfolder = gr.Button('📂 打开输出目录', scale=1)
 
                             # 自动化 LLM 纠错配置（隐藏）
                             state_enable_llm = gr.State(True)
                             state_whisper_hidden = gr.State("")
-                            state_rag_kb_dir = gr.State(self.args.rag_kb_dir)
+                            state_rag_kb_dir = gr.State(self.config.rag_kb_dir)
                             state_ollama_base_url = gr.State("http://localhost:11434")
                             state_ollama_model = gr.State("qwen2.5:3b")
                             state_rag_top_k = gr.State(4)
@@ -537,55 +335,73 @@ class App:
                                 state_rag_similarity,
                             ]
                             params = params + pipeline_params
-                            btn_run.click(fn=self.whisper_inf.transcribe_file,
-                                          inputs=params,
-                                          outputs=[state_whisper_hidden, tb_corrected_output, files_subtitles, state_chat_payload])
+
+                            def _submit_transcription_job(*job_params):
+                                result, job_id = self.job_manager.run_sync(
+                                    "transcription",
+                                    self.whisper_inf.transcribe_file,
+                                    *job_params,
+                                )
+                                status = f"任务 {job_id} 已完成 ✅" if job_id else "任务已完成"
+                                if isinstance(result, tuple):
+                                    result = list(result)
+                                elif not isinstance(result, list):
+                                    result = [result]
+                                result.append(status)
+                                return result
+
+                            btn_run.click(
+                                fn=_submit_transcription_job,
+                                inputs=params,
+                                outputs=[state_whisper_hidden, tb_corrected_output, files_subtitles, state_chat_payload, job_status_md],
+                            )
                             btn_openfolder.click(fn=lambda: self.open_folder("outputs"), inputs=None, outputs=None)
 #-------------------------------------------------------------------------------------------------------------
                         with gr.TabItem(_("访谈助手")):
-                            with gr.Column():
-                                chat_history = gr.Chatbot(
-                                    label="临时 RAG 对话",
-                                    height=420,
-                                    show_copy_button=True,
-                                    show_label=True,
-                                )
-                                tb_chat_input = gr.Textbox(
-                                    label="提问或指令",
-                                    placeholder="例如：请总结这段访谈的核心观点",
-                                    lines=2,
-                                )
-                            with gr.Row():
-                                slider_chat_top_k = gr.Slider(
-                                    minimum=1,
-                                    maximum=8,
-                                    step=1,
-                                    value=4,
-                                    label="检索片段数量 (top_k)",
-                                )
-                                slider_chat_similarity = gr.Slider(
-                                    minimum=0.5,
-                                    maximum=0.95,
-                                    step=0.05,
-                                    value=0.8,
-                                    label="最小相似度阈值",
-                                )
-                            with gr.Row():
-                                btn_chat_send = gr.Button("发送", variant="primary")
-                                btn_chat_clear = gr.Button("清空对话", variant="secondary")
-                        gr.Markdown(
-                            "完成一次转写后即可使用访谈内容进行问答；若未加载文本，则自动作为普通 AI 回答。"
-                        )
-                        with gr.Accordion("上传补充文档（可选）", open=False):
-                            gr.Markdown("上传 `.txt` / `.md` 文件作为临时上下文，帮助 AI 回答。")
-                            chat_upload = gr.Files(
-                                label="选择文本或 Markdown 文件",
-                                file_types=["file"],
-                                type="filepath"
-                            )
-                            btn_load_chat_docs = gr.Button("载入到访谈助手", variant="secondary")
-                            chat_upload_feedback = gr.Markdown("")
+                            gr.Markdown("#### 访谈助手 / RAG 临时问答")
+                            gr.Markdown("完成转写后，可在此基于最新字幕与临时上传的文本文档进行问答或总结。未加载文本时自动回退为普通聊天。")
+                            with gr.Row(equal_height=False):
+                                with gr.Column(scale=6, min_width=480):
+                                    chat_history = gr.Chatbot(
+                                        label="对话记录",
+                                        height=420,
+                                        show_copy_button=True,
+                                        show_label=True,
+                                    )
+                                    with gr.Row():
+                                        btn_chat_clear = gr.Button("清空对话", variant="secondary")
 
+                                with gr.Column(scale=4, min_width=360):
+                                    tb_chat_input = gr.Textbox(
+                                        label="提问或指令",
+                                        placeholder="例如：请总结这段访谈的核心观点",
+                                        lines=3,
+                                    )
+                                    slider_chat_top_k = gr.Slider(
+                                        minimum=1,
+                                        maximum=8,
+                                        step=1,
+                                        value=4,
+                                        label="检索片段数量 (top_k)",
+                                    )
+                                    slider_chat_similarity = gr.Slider(
+                                        minimum=0.5,
+                                        maximum=0.95,
+                                        step=0.05,
+                                        value=0.8,
+                                        label="最小相似度阈值",
+                                    )
+                                    btn_chat_send = gr.Button("发送", variant="primary")
+                                    gr.Markdown("完成一次转写后即可使用访谈内容进行问答；若未加载文本，则自动作为普通 AI 回答。")
+                                    with gr.Accordion("上传补充文档（可选）", open=False):
+                                        gr.Markdown("上传 `.txt` / `.md` 文件作为临时上下文，帮助 AI 回答。")
+                                        chat_upload = gr.Files(
+                                            label="选择文本或 Markdown 文件",
+                                            file_types=["file"],
+                                            type="filepath",
+                                        )
+                                        btn_load_chat_docs = gr.Button("载入到访谈助手", variant="secondary")
+                                        chat_upload_feedback = gr.Markdown("")
                             def _chat_with_transcript(
                                 message: str,
                                 history: Optional[List[List[str]]],
@@ -722,24 +538,29 @@ class App:
                         with gr.TabItem("图像搜索"):
                             # Initialize face search service once
                             if not hasattr(self, "face_search"):
-                                self.face_search = FaceSearchService(db_dir=os.path.join(self.args.output_dir, "face_db"))
+                                self.face_search = self.context.face_search_service
 
-                            with gr.Row():
-                                with gr.Column(scale=4):
-                                    img_query = gr.Image(
-                                        type="filepath",
-                                        label="上传人脸图像进行搜索",
-                                        height=240,
-                                        show_download_button=False,
-                                    )
-                                    tb_result_prefix = gr.Textbox(
-                                        label="匹配结果重命名前缀（可选，仅管理员可用）",
-                                        placeholder="例如：张三_",
-                                        lines=1,
-                                        visible=False
-                                    )
-                                    
-                                    with gr.Accordion("搜索设置", open=False):
+                            gr.Markdown("#### 以图搜图 · 人脸检索")
+                            gr.Markdown("上传一张包含人脸的图片，系统将基于人脸特征在数据库中查找最相似的结果，可对结果执行批量重命名和数据库维护。")
+
+                            with gr.Row(equal_height=False):
+                                with gr.Column(scale=4, min_width=360, elem_id="face_search_controls"):
+                                    with gr.Group():
+                                        gr.Markdown("**1. 上传查询图像**")
+                                        img_query = gr.Image(
+                                            type="filepath",
+                                            label="上传人脸图像",
+                                            height=240,
+                                            show_download_button=False,
+                                        )
+                                        tb_result_prefix = gr.Textbox(
+                                            label="结果重命名前缀（仅管理员可见）",
+                                            placeholder="例如：张三_",
+                                            lines=1,
+                                            visible=False,
+                                        )
+                                    with gr.Group():
+                                        gr.Markdown("**2. 设置搜索参数**")
                                         num_top_k = gr.Slider(
                                             minimum=1,
                                             maximum=100,
@@ -754,65 +575,60 @@ class App:
                                             step=0.05,
                                             label="最大距离阈值（越小越相似）",
                                         )
-                                    
-                                    with gr.Row():
-                                        btn_search = gr.Button("搜索相似图像", variant="primary")
-                                        btn_rename_results = gr.Button("为搜索结果加前缀", variant="secondary", visible=False)
-                                    tb_status = gr.Textbox(label="状态", interactive=False, lines=3)
-                                    state_ranked_results = gr.State([])
-                                    
-                                    # Database Statistics
-                                    with gr.Accordion("数据库统计", open=False):
+                                        with gr.Row():
+                                            btn_search = gr.Button("搜索相似图像", variant="primary")
+                                            btn_rename_results = gr.Button("批量加前缀", variant="secondary", visible=False)
+                                        tb_status = gr.Textbox(label="状态", interactive=False, lines=3)
+                                        state_ranked_results = gr.State([])
+
+                                    with gr.Group():
+                                        gr.Markdown("**数据库统计**")
                                         btn_refresh_stats = gr.Button("刷新统计", size="sm")
                                         tb_stats = gr.Textbox(
                                             label="统计信息",
                                             interactive=False,
                                             lines=4,
-                                            value="点击'刷新统计'查看数据库信息。"
+                                            value="点击“刷新统计”查看当前数据库规模。",
                                         )
 
-                                    with gr.Accordion("数据库管理", open=False):
-                                        files_to_add = gr.Files(
-                                            type="filepath",
-                                            label="上传图像添加到数据库（支持批量）"
+                                    with gr.Accordion("数据库运维", open=False):
+                                        with gr.Tabs():
+                                            with gr.Tab("添加图像"):
+                                                files_to_add = gr.Files(
+                                                    type="filepath",
+                                                    label="上传图像添加到数据库（支持多选）",
+                                                )
+                                                btn_add = gr.Button("添加到数据库")
+                                                gr.Markdown("或批量导入整个文件夹：")
+                                                fe_folder = gr.File(
+                                                    label="选择文件夹",
+                                                    file_count="directory",
+                                                    type="filepath",
+                                                )
+                                                cb_folder_include_sub = gr.Checkbox(
+                                                    label="包含子目录",
+                                                    value=True,
+                                                )
+                                                btn_add_folder = gr.Button("批量导入文件夹")
+                                            with gr.Tab("删除 / 清理"):
+                                                files_to_delete = gr.Files(
+                                                    type="filepath",
+                                                    label="选择要删除的图像",
+                                                )
+                                                btn_delete = gr.Button("从数据库删除", variant="stop")
+                                                with gr.Row():
+                                                    btn_cleanup = gr.Button("清理孤儿记录", size="sm")
+                                                    btn_clear_db = gr.Button("清空数据库", variant="stop", size="sm")
+
+                                with gr.Column(scale=8, min_width=520, elem_id="face_search_results"):
+                                    with gr.Group():
+                                        gr.Markdown("**搜索结果预览**")
+                                        gallery = gr.Gallery(
+                                            label="搜索结果",
+                                            columns=5,
+                                            height=520,
+                                            show_label=True,
                                         )
-                                        btn_add = gr.Button("添加到数据库")
-                                        
-                                        fe_folder = gr.File(
-                                            label="选择要添加的文件夹",
-                                            file_count="directory",
-                                            type="filepath"
-                                        )
-                                        cb_folder_include_sub = gr.Checkbox(
-                                            label="包含子目录",
-                                            value=True
-                                        )
-                                        btn_add_folder = gr.Button("添加文件夹到数据库")
-                                        
-                                        # Delete and cleanup functions
-                                        files_to_delete = gr.Files(
-                                            type="filepath",
-                                            label="选择要从数据库删除的图像"
-                                        )
-                                        btn_delete = gr.Button("从数据库删除", variant="stop")
-                                        
-                                        btn_cleanup = gr.Button(
-                                            "清理孤儿记录",
-                                            size="sm"
-                                        )
-                                        btn_clear_db = gr.Button(
-                                            "清空整个数据库",
-                                            variant="stop",
-                                            size="sm"
-                                        )
-                                        
-                                with gr.Column(scale=8):
-                                    gallery = gr.Gallery(
-                                        label="搜索结果",
-                                        columns=5,
-                                        height=520,
-                                        show_label=True,
-                                    )
 
                         def _safe_rename_file(original_path: str, prefix: str):
                             base_dir = os.path.dirname(original_path)
@@ -1135,6 +951,7 @@ class App:
                         gr.update(visible=is_admin),
                         gr.update(visible=is_main_admin),
                         gr.update(visible=is_admin),
+                        gr.update(visible=is_admin),
                         f"✅ {message}",
                         dropdown_update,
                         user_role_display,
@@ -1146,6 +963,7 @@ class App:
                 return (
                     fallback_state,
                     gr.update(visible=True),
+                    gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
@@ -1168,6 +986,7 @@ class App:
                     gr.update(visible=False),
                     gr.update(visible=False),
                     gr.update(visible=False),
+                    gr.update(visible=False),
                     message,
                     gr.update(value=None, choices=[]),
                     gr.update(value=""),
@@ -1184,6 +1003,25 @@ class App:
                 if pending:
                     return gr.update(choices=pending, value=pending[0]), f"共有 {len(pending)} 个待审核用户。"
                 return gr.update(choices=[], value=None), "暂无待审核用户。"
+
+            def _refresh_jobs_status(user_state):
+                if not user_state or not user_state.get("authenticated"):
+                    return "请先登录后再操作。"
+                if user_state.get("role") != "admin":
+                    return "仅管理员可以查看任务状态。"
+                jobs = self.job_manager.list_jobs(limit=20)
+                if not jobs:
+                    return "暂无后台任务记录。"
+                lines = []
+                for job in jobs:
+                    duration = ""
+                    if job.get("finished_at") and (job.get("started_at") or job.get("submitted_at")):
+                        start_ts = job.get("started_at") or job.get("submitted_at")
+                        duration_value = max(0.0, job["finished_at"] - start_ts)
+                        duration = f"，耗时 {duration_value:.1f}s"
+                    error_msg = f"，错误：{job['error']}" if job.get("error") else ""
+                    lines.append(f"- **{job['name']}** ({job['id']}): {job['status']}{duration}{error_msg}")
+                return "\n".join(lines)
 
             def _approve_pending(selected_user, user_state):
                 if not user_state or not user_state.get("authenticated"):
@@ -1247,7 +1085,7 @@ class App:
                     return "请先登录后再操作。"
                 if user_state.get("role") != "admin":
                     return "仅管理员可以更新知识库索引。"
-                kb_dir = self.args.rag_kb_dir
+                kb_dir = self.config.rag_kb_dir
                 try:
                     gr.Info("开始重建知识库索引，请稍候...")
                     message = self.text_corrector.rebuild_index(kb_dir)
@@ -1282,12 +1120,12 @@ class App:
             btn_login.click(
                 fn=_handle_login,
                 inputs=[tb_login_username, tb_login_password, auth_state],
-                outputs=[auth_state, login_view, main_view, admin_panel, admin_role_panel, rag_panel, login_feedback, pending_users_dropdown, user_info_box, tb_result_prefix, btn_rename_results]
+                outputs=[auth_state, login_view, main_view, admin_panel, admin_role_panel, rag_panel, jobs_panel, login_feedback, pending_users_dropdown, user_info_box, tb_result_prefix, btn_rename_results]
             )
             btn_logout.click(
                 fn=_handle_logout,
                 inputs=[auth_state],
-                outputs=[auth_state, login_view, main_view, admin_panel, admin_role_panel, rag_panel, login_feedback, pending_users_dropdown, user_info_box, tb_result_prefix, btn_rename_results]
+                outputs=[auth_state, login_view, main_view, admin_panel, admin_role_panel, rag_panel, jobs_panel, login_feedback, pending_users_dropdown, user_info_box, tb_result_prefix, btn_rename_results]
             )
             btn_refresh_pending.click(
                 fn=_refresh_pending,
@@ -1324,22 +1162,27 @@ class App:
                 inputs=[auth_state],
                 outputs=[rag_update_feedback]
             )
+            btn_refresh_jobs.click(
+                fn=_refresh_jobs_status,
+                inputs=[auth_state],
+                outputs=[jobs_status_md],
+            )
 
         # Launch the app with optional gradio settings
-        args = self.args
+        cfg = self.config
         self.app.queue(
-            api_open=args.api_open
+            api_open=cfg.api_open
         ).launch(
-            share=args.share,
-            server_name=args.server_name,
-            server_port=args.server_port,
-            root_path=args.root_path if args.root_path else None,
-            inbrowser=args.inbrowser,
-            ssl_verify=args.ssl_verify,
-            ssl_keyfile=args.ssl_keyfile,
-            ssl_keyfile_password=args.ssl_keyfile_password,
-            ssl_certfile=args.ssl_certfile,
-            allowed_paths=eval(args.allowed_paths) if args.allowed_paths else None
+            share=cfg.share,
+            server_name=cfg.server_name,
+            server_port=cfg.server_port,
+            root_path=cfg.root_path if cfg.root_path else None,
+            inbrowser=cfg.inbrowser,
+            ssl_verify=cfg.ssl_verify,
+            ssl_keyfile=cfg.ssl_keyfile,
+            ssl_keyfile_password=cfg.ssl_keyfile_password,
+            ssl_certfile=cfg.ssl_certfile,
+            allowed_paths=eval(cfg.allowed_paths) if cfg.allowed_paths else None
         )
 
     @staticmethod
@@ -1351,59 +1194,11 @@ class App:
             logger.info(f"The directory path {folder_path} has newly created.")
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--whisper_type', type=str, default=WhisperImpl.FASTER_WHISPER.value,
-                    choices=[item.value for item in WhisperImpl],
-                    help='A type of the whisper implementation (Github repo name)')
-parser.add_argument('--share', type=str2bool, default=False, nargs='?', const=True, help='Gradio share value')
-parser.add_argument('--server_name', type=str, default='0.0.0.0', help='Gradio server host')
-parser.add_argument('--server_port', type=int, default=None, help='Gradio server port')
-parser.add_argument('--root_path', type=str, default=None, help='Gradio root path')
-parser.add_argument('--username', type=str, default=None, help='Gradio authentication username')
-parser.add_argument('--password', type=str, default=None, help='Gradio authentication password')
-parser.add_argument('--theme', type=str, default=None, help='Gradio Blocks theme')
-parser.add_argument('--colab', type=str2bool, default=False, nargs='?', const=True, help='Is colab user or not')
-parser.add_argument('--api_open', type=str2bool, default=False, nargs='?', const=True,
-                    help='Enable api or not in Gradio')
-parser.add_argument('--allowed_paths', type=str, default=None, help='Gradio allowed paths')
-parser.add_argument('--inbrowser', type=str2bool, default=True, nargs='?', const=True,
-                    help='Whether to automatically start Gradio app or not')
-parser.add_argument('--ssl_verify', type=str2bool, default=True, nargs='?', const=True,
-                    help='Whether to verify SSL or not')
-parser.add_argument('--auth_db_path', type=str, default=DEFAULT_AUTH_DB_PATH, help='Path to the SQLite database used for UI login')
-parser.add_argument('--default_admin_username', type=str, default=DEFAULT_ADMIN_USERNAME,
-                    help='Bootstrap admin username if database is empty')
-parser.add_argument('--default_admin_password', type=str, default=DEFAULT_ADMIN_PASSWORD,
-                    help='Bootstrap admin password if database is empty')
-parser.add_argument('--ssl_keyfile', type=str, default=None, help='SSL Key file location')
-parser.add_argument('--ssl_keyfile_password', type=str, default=None, help='SSL Key file password')
-parser.add_argument('--ssl_certfile', type=str, default=None, help='SSL cert file location')
-parser.add_argument('--whisper_model_dir', type=str, default=WHISPER_MODELS_DIR,
-                    help='Directory path of the whisper model')
-parser.add_argument('--faster_whisper_model_dir', type=str, default=FASTER_WHISPER_MODELS_DIR,
-                    help='Directory path of the faster-whisper model')
-parser.add_argument('--insanely_fast_whisper_model_dir', type=str,
-                    default=INSANELY_FAST_WHISPER_MODELS_DIR,
-                    help='Directory path of the insanely-fast-whisper model')
-parser.add_argument('--diarization_model_dir', type=str, default=DIARIZATION_MODELS_DIR,
-                    help='Directory path of the diarization model')
-parser.add_argument('--nllb_model_dir', type=str, default=NLLB_MODELS_DIR,
-                    help='Directory path of the Facebook NLLB model')
-parser.add_argument('--uvr_model_dir', type=str, default=UVR_MODELS_DIR,
-                    help='Directory path of the UVR model')
-parser.add_argument('--output_dir', type=str, default=OUTPUT_DIR, help='Directory path of the outputs')
-parser.add_argument('--rag_kb_dir', type=str, default=KNOWLEDGE_BASE_DIR,
-                    help='Directory path of txt knowledge base used for RAG correction')
-parser.add_argument('--rag_store_dir', type=str, default=RAG_STORE_DIR,
-                    help='Persistent directory for RAG vector store')
-parser.add_argument('--rag_embedding_model', type=str,
-                    default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                    help='SentenceTransformer model name for RAG correction')
-_args = parser.parse_args()
+def main():
+    config = parse_app_config()
+    application = App(config=config)
+    application.launch()
+
 
 if __name__ == "__main__":
-    
-    
-    app = App(args=_args)
-    app.launch()
-    
+    main()
